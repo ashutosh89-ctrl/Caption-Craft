@@ -1,78 +1,93 @@
 import { logger } from "./logger";
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
-const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 1500;
 
-async function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+// Per-model call timeout — avoids hanging on slow free models
+const VISION_TIMEOUT_MS = 12000;
+const TEXT_TIMEOUT_MS = 25000;
 
-async function callOpenRouter(
+// Free text-only models for caption/refine — NOT rate-limited like vision models
+const CAPTION_MODELS = [
+  "meta-llama/llama-3.3-70b-instruct:free",
+  "openai/gpt-oss-120b:free",
+  "openai/gpt-oss-20b:free",
+  "minimax/minimax-m2.5:free",
+];
+
+const REFINE_MODELS = [
+  "meta-llama/llama-3.3-70b-instruct:free",
+  "openai/gpt-oss-20b:free",
+  "minimax/minimax-m2.5:free",
+];
+
+// Free vision models — highly unreliable/rate-limited; vision step is best-effort only
+const VISION_MODELS = [
+  "google/gemma-4-31b-it:free",
+  "google/gemma-4-26b-a4b-it:free",
+];
+
+async function callModel(
   model: string,
   messages: Array<{ role: string; content: unknown }>,
-  retries = MAX_RETRIES
-): Promise<string> {
+  timeoutMs: number
+): Promise<string | null> {
   const apiKey = process.env["OPENROUTER_API_KEY"];
-  if (!apiKey) {
-    throw new Error("OPENROUTER_API_KEY is not set");
+  if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://captioncraft.replit.app",
+        "X-Title": "CaptionCraft",
+      },
+      body: JSON.stringify({ model, messages }),
+    });
+
+    if (!response.ok) {
+      const status = response.status;
+      logger.warn({ model, status }, "OpenRouter non-OK");
+      return null;
+    }
+
+    const json = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const content = json.choices?.[0]?.message?.content;
+    if (!content) {
+      logger.warn({ model }, "Empty content");
+      return null;
+    }
+
+    return content;
+  } catch (err) {
+    const isAbort = err instanceof Error && err.name === "AbortError";
+    logger.warn({ model, isAbort, err: isAbort ? "timeout" : err }, "Model call failed");
+    return null;
+  } finally {
+    clearTimeout(timer);
   }
+}
 
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          "HTTP-Referer": "https://captioncraft.replit.app",
-          "X-Title": "CaptionCraft",
-        },
-        body: JSON.stringify({
-          model,
-          messages,
-        }),
-      });
-
-      if (!response.ok) {
-        const errText = await response.text();
-        logger.warn(
-          { model, attempt, status: response.status, errText },
-          "OpenRouter non-OK response"
-        );
-        if (attempt < retries) {
-          await sleep(RETRY_DELAY_MS * attempt);
-          continue;
-        }
-        throw new Error(`OpenRouter error ${response.status}: ${errText}`);
-      }
-
-      const json = (await response.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-      };
-      const content = json.choices?.[0]?.message?.content;
-
-      if (!content) {
-        logger.warn({ model, attempt, json }, "Empty content from OpenRouter");
-        if (attempt < retries) {
-          await sleep(RETRY_DELAY_MS * attempt);
-          continue;
-        }
-        throw new Error("Empty response from OpenRouter after retries");
-      }
-
-      return content;
-    } catch (err) {
-      if (attempt < retries) {
-        logger.warn({ model, attempt, err }, "OpenRouter call failed, retrying");
-        await sleep(RETRY_DELAY_MS * attempt);
-      } else {
-        throw err;
-      }
+async function callWithFallback(
+  models: string[],
+  messages: Array<{ role: string; content: unknown }>,
+  timeoutMs: number
+): Promise<string> {
+  for (const model of models) {
+    const result = await callModel(model, messages, timeoutMs);
+    if (result) {
+      logger.info({ model }, "Succeeded");
+      return result;
     }
   }
-
-  throw new Error("OpenRouter: exceeded max retries");
+  throw new Error(`All ${models.length} models failed`);
 }
 
 export interface VisualAnalysis {
@@ -89,51 +104,52 @@ export interface GeneratedCaption {
   cta: string;
 }
 
+const FALLBACK_VISUAL: VisualAnalysis = {
+  scene_description: "An engaging photo shared by an Indian content creator",
+  mood: "vibrant and expressive",
+  key_objects: ["person", "setting", "moment"],
+  color_palette: ["warm", "vivid"],
+  human_count: 1,
+};
+
 export async function extractVisuals(
   imageBase64: string,
   imageType: string
 ): Promise<VisualAnalysis> {
-  const content = await callOpenRouter("meta-llama/llama-4-maverick:free", [
-    {
-      role: "user",
-      content: [
+  try {
+    const content = await callWithFallback(
+      VISION_MODELS,
+      [
         {
-          type: "text",
-          text: `Analyze this image and return ONLY a valid JSON object (no markdown, no explanation) with these exact fields:
-{
-  "scene_description": "a detailed description of the scene",
-  "mood": "the overall mood/feeling",
-  "key_objects": ["list", "of", "main", "objects"],
-  "color_palette": ["dominant", "colors"],
-  "human_count": 0
-}`,
-        },
-        {
-          type: "image_url",
-          image_url: {
-            url: `data:${imageType};base64,${imageBase64}`,
-          },
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `Analyze this image. Return ONLY valid JSON — no markdown, no fences, no text outside the JSON:
+{"scene_description":"...","mood":"...","key_objects":["..."],"color_palette":["..."],"human_count":0}`,
+            },
+            {
+              type: "image_url",
+              image_url: { url: `data:${imageType};base64,${imageBase64}` },
+            },
+          ],
         },
       ],
-    },
-  ]);
+      VISION_TIMEOUT_MS
+    );
 
-  const cleaned = content
-    .replace(/```json\n?/g, "")
-    .replace(/```\n?/g, "")
-    .trim();
+    const objMatch = content.replace(/```[\s\S]*?```/g, "").match(/\{[\s\S]*\}/);
+    if (!objMatch) throw new Error("No JSON object found");
 
-  try {
-    return JSON.parse(cleaned) as VisualAnalysis;
-  } catch {
-    logger.warn({ cleaned }, "Failed to parse visual analysis JSON");
-    return {
-      scene_description: cleaned.slice(0, 200),
-      mood: "vibrant",
-      key_objects: [],
-      color_palette: [],
-      human_count: 0,
-    };
+    const parsed = JSON.parse(objMatch[0]) as VisualAnalysis;
+    if (parsed.scene_description) {
+      logger.info("Vision extraction succeeded");
+      return parsed;
+    }
+    throw new Error("Missing scene_description");
+  } catch (err) {
+    logger.warn({ err }, "Vision extraction unavailable — using fallback context");
+    return FALLBACK_VISUAL;
   }
 }
 
@@ -144,62 +160,43 @@ export async function generateCaptions(
 ): Promise<GeneratedCaption[]> {
   const toneInstructions: Record<string, string> = {
     "Desi/Hinglish":
-      "Write in smooth Hinglish — a natural blend of Hindi and English that sounds like how young Indians actually talk. No forced translations, no brackets. Keep it organic and relatable.",
+      "Write in smooth Hinglish — natural blend of Hindi and English that sounds like how young Indians actually talk. No forced translations. Keep it organic.",
     Funny:
-      "Write with sharp wit and humor that lands. Include funny observations, unexpected twists, or self-deprecating jokes. Make people laugh out loud.",
+      "Write with sharp wit and humor. Unexpected twists, self-deprecating observations, make people laugh.",
     Professional:
-      "Write in polished, confident professional English. Authority, insight, and value-driven. LinkedIn-ready. No slang.",
+      "Polished, confident, insight-driven English. Thought leadership. LinkedIn-ready.",
     Savage:
-      "Write with bold, unapologetic energy. Clever, cutting, confident — the kind of caption that makes people screenshot it.",
+      "Bold, unapologetic, clever. The kind of caption people screenshot.",
   };
-
-  const toneGuide =
-    toneInstructions[tone] ||
-    `Write in a ${tone} tone that feels authentic and engaging.`;
 
   const platformInstructions: Record<string, string> = {
-    Instagram:
-      "Optimize for Instagram: conversational, visual storytelling, high engagement hook in first line. Up to 2200 chars.",
-    LinkedIn:
-      "Optimize for LinkedIn: professional insights, personal story with a lesson, thought leadership. Up to 3000 chars.",
-    YouTube:
-      "Optimize for YouTube description: catchy hook, keywords, value proposition, timestamp hints. Up to 5000 chars.",
+    Instagram: "Instagram: visual storytelling, hook in first line, conversational.",
+    LinkedIn: "LinkedIn: professional story with a lesson, thought leadership.",
+    YouTube: "YouTube: catchy hook, searchable keywords, value proposition.",
   };
 
-  const platformGuide =
-    platformInstructions[platform] ||
-    `Optimize for ${platform} audience and format.`;
+  const prompt = `You are an elite social media strategist for Indian creators. Write exactly 5 viral captions.
 
-  const prompt = `You are an elite social media strategist for Indian creators. Generate exactly 5 viral captions.
+IMAGE: ${visual.scene_description}
+Mood: ${visual.mood} | Elements: ${visual.key_objects.join(", ")} | Colors: ${visual.color_palette.join(", ")} | People: ${visual.human_count}
 
-VISUAL CONTEXT:
-${JSON.stringify(visual, null, 2)}
+PLATFORM: ${platform} — ${platformInstructions[platform] ?? platform}
+TONE: ${tone} — ${toneInstructions[tone] ?? tone}
 
-PLATFORM: ${platform}
-${platformGuide}
+Each caption must:
+- Open with a scroll-stopping hook
+- Flow naturally, no awkward phrasing
+- Include 5-8 specific, contextual hashtags (no #love #life generics)
+- End with exactly ONE strong call-to-action
 
-TONE: ${tone}
-${toneGuide}
+Output ONLY this JSON array — no markdown, no fences, nothing else before or after:
+[{"text":"caption without hashtags","hashtags":["tag1","tag2","tag3","tag4","tag5"],"cta":"call to action"},{"text":"...","hashtags":["..."],"cta":"..."},{"text":"...","hashtags":["..."],"cta":"..."},{"text":"...","hashtags":["..."],"cta":"..."},{"text":"...","hashtags":["..."],"cta":"..."}]`;
 
-REQUIREMENTS for EACH caption:
-- Start with a scroll-stopping hook line
-- Clean grammar, natural flow
-- 5-8 highly relevant contextual hashtags (no generic ones)
-- Exactly ONE strong Call-To-Action (CTA)
-- Platform-optimized length
-
-Return ONLY a valid JSON array (no markdown, no explanation) with exactly 5 objects:
-[
-  {
-    "text": "the full caption text without hashtags",
-    "hashtags": ["hashtag1", "hashtag2", "hashtag3", "hashtag4", "hashtag5"],
-    "cta": "the call to action"
-  }
-]`;
-
-  const content = await callOpenRouter("deepseek/deepseek-r1:free", [
-    { role: "user", content: prompt },
-  ]);
+  const content = await callWithFallback(
+    CAPTION_MODELS,
+    [{ role: "user", content: prompt }],
+    TEXT_TIMEOUT_MS
+  );
 
   const cleaned = content
     .replace(/```json\n?/g, "")
@@ -207,18 +204,19 @@ Return ONLY a valid JSON array (no markdown, no explanation) with exactly 5 obje
     .replace(/<think>[\s\S]*?<\/think>/g, "")
     .trim();
 
+  const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
+  const jsonStr = arrayMatch ? arrayMatch[0] : cleaned;
+
   try {
-    const parsed = JSON.parse(cleaned) as GeneratedCaption[];
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      return parsed.slice(0, 5);
-    }
-    throw new Error("Invalid captions array");
+    const parsed = JSON.parse(jsonStr) as GeneratedCaption[];
+    if (Array.isArray(parsed) && parsed.length > 0) return parsed.slice(0, 5);
+    throw new Error("Not an array or empty");
   } catch {
-    logger.warn({ cleaned: cleaned.slice(0, 500) }, "Failed to parse captions JSON");
+    logger.warn({ jsonStr: jsonStr.slice(0, 400) }, "Failed to parse captions");
     const fallback: GeneratedCaption = {
-      text: "Unable to generate caption. Please try again.",
-      hashtags: ["#content", "#creator"],
-      cta: "Share your thoughts below!",
+      text: "AI returned an unexpected format. Please try generating again.",
+      hashtags: ["#content", "#creator", "#india", "#viral"],
+      cta: "Drop your thoughts in the comments!",
     };
     return Array(5).fill(fallback) as GeneratedCaption[];
   }
@@ -231,41 +229,27 @@ export async function refineCaption(
   platform: string,
   tone: string
 ): Promise<GeneratedCaption> {
-  const prompt = `You are a precision editor for social media captions. Polish and refine this caption to perfection.
+  const prompt = `Polish this ${platform} caption (tone: ${tone}).
 
-ORIGINAL CAPTION:
-${captionText}
-
-HASHTAGS: ${hashtags.join(" ")}
+Caption: ${captionText}
+Hashtags: ${hashtags.join(" ")}
 CTA: ${cta}
-PLATFORM: ${platform}
-TONE: ${tone}
 
-Your job:
-1. Fix any structural issues or awkward phrasing
-2. Strengthen the hook line
-3. Trim weak or irrelevant hashtags, keep only the best 5-8
-4. Make the CTA sharper and more compelling
-5. Ensure the tone is consistent and natural
+Strengthen the hook, trim weak hashtags (keep 5-8 best), sharpen the CTA, fix any awkward phrasing.
 
-Return ONLY a valid JSON object (no markdown, no explanation):
-{
-  "text": "the refined caption text",
-  "hashtags": ["best", "hashtags", "only"],
-  "cta": "sharpened call to action"
-}`;
-
-  const content = await callOpenRouter("meta-llama/llama-4-scout:free", [
-    { role: "user", content: prompt },
-  ]);
-
-  const cleaned = content
-    .replace(/```json\n?/g, "")
-    .replace(/```\n?/g, "")
-    .trim();
+Output ONLY this JSON — no markdown, no fences:
+{"text":"refined caption","hashtags":["tag1","tag2","tag3","tag4","tag5"],"cta":"sharpened cta"}`;
 
   try {
-    return JSON.parse(cleaned) as GeneratedCaption;
+    const content = await callWithFallback(
+      REFINE_MODELS,
+      [{ role: "user", content: prompt }],
+      TEXT_TIMEOUT_MS
+    );
+
+    const objMatch = content.replace(/```[\s\S]*?```/g, "").match(/\{[\s\S]*\}/);
+    if (!objMatch) throw new Error("No JSON found");
+    return JSON.parse(objMatch[0]) as GeneratedCaption;
   } catch {
     return { text: captionText, hashtags, cta };
   }
