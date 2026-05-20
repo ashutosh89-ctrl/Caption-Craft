@@ -1,0 +1,35 @@
+Project Name: CaptionCraft — AI Social Media Assistant for Indian Creators
+
+Tech Stack & Environment Setup:
+- Build a full-stack Next.js (App Router) or Vite + Node.js application inside Replit.
+- Use Tailwind CSS for a modern, high-contrast dark-themed creator dashboard.
+- Use a single environment variable: OPENROUTER_API_KEY. All API headers must use 'https://openrouter.ai/api/v1' as the base URL.
+- Implement basic user authentication (signup/login) using a local lowdb or SQLite database to save user dashboard sessions and historically generated captions.
+
+Core Pipeline Logic (Two-Step Optimization):
+When a user uploads an image/video, the backend must execute a strict sequenced pipeline:
+
+Step 1: Visual Extraction
+- API Endpoint: https://openrouter.ai/api/v1/chat/completions
+- Model ID: meta-llama/llama-4-maverick:free
+- Task: Receive the user's uploaded asset. Instruct the model to return a structured JSON response containing: scene_description, mood, key_objects, color_palette, and human_count.
+
+Step 2: Generation & Polishing (One-Shot Execution)
+- API Endpoint: https://openrouter.ai/api/v1/chat/completions
+- Model ID: deepseek/deepseek-r1:free
+- Input Context: Combine the JSON data from Step 1 + the user's requested platform (Instagram/LinkedIn/YouTube) + the user's chosen vibe/tone (e.g., "Desi/Hinglish", "Funny", "Professional", "Savage").
+- Task: Leverage R1's reasoning capability to write AND polish 5 raw, highly engaging captions in one single shot. The instructions given to R1 must force it to handle final editing metrics inside its thinking process: clean grammar, high-converting hook lines, smooth natural-sounding Hinglish (no forced translations), 5-8 highly relevant contextual hashtags, and exactly one strong Call-To-Action (CTA).
+
+Fallback Flag (Conditional Step 3):
+- Only if the user clicks a manual "Refine & Re-Polish" button on their UI dashboard, trigger a call to "meta-llama/llama-4-scout:free".
+- Scout will take the specific generated caption text, fix any structural bugs, trim weak hashtags, and outputs the absolute clean final copy. Do not call this model on the initial upload pass.
+
+UI/UX Features:
+1. Drag-and-drop zone for media assets with immediate local image preview.
+2. Form fields to choose the target social platform and tone selection dropdowns.
+3. A multi-stage progress loading animation showing state updates (e.g., "Maverick is scanning visuals..." -> "DeepSeek R1 is reasoning captions...").
+4. Result dashboard showing all 5 generated captions inside organized copyable text-cards with a clear "Copy to Clipboard" button.
+5. A "Save to Gallery" toggle that archives the chosen caption to the user's dashboard history.
+
+Error and Rate Handling:
+- Since free openrouter models can occasionally suffer from empty responses or timeout limits, write robust backend retry blocks (up to 3 retries) with elegant loading-state failure feedback on the UI screen if an API endpoint times out.
