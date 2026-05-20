@@ -1,0 +1,23 @@
+Project Name: CaptionCraft — High-Availability Indian Creator Assistant
+
+System & Environment Constraints:
+- Stack: Next.js (App Router) or Vite + Express Node.js.
+- Primary Variable: PROCESS.ENV.OPENROUTER_API_KEY. All requests hit 'https://openrouter.ai/api/v1/chat/completions'.
+- Storage: Use a lightweight embedded database (SQLite or lowdb) to handle local sessions and preserve generation records.
+
+API Error-Handling & Anti-Crash Requirements:
+1. Rate-Limit Protection (429 Handling): Build an axios/fetch interceptor implementing exponential backoff. If OpenRouter returns an HTTP 429 status code, wait 2 seconds, retry up to 3 times, increasing wait intervals. If all retries fail, return an elegant message to the user: "Servers are heavily loaded, retrying in a moment...".
+2. Bypassing Network Timeouts (Streaming Protocol): For the DeepSeek R1 pass, the backend route MUST use streaming response blocks ('stream: true'). Pipe the stream continuously back to the frontend to ensure the HTTP connection never suffers a gateway timeout while the model is thinking.
+3. Content Filtering (Thinking Block Hider): DeepSeek R1 outputs raw tags like `<think>...</think>`. The frontend component must parse incoming streams dynamically, catch everything inside the think tags, and display a loading state like: "Thinking Context: [AI is reasoning through your image profile...]" instead of exposing raw reasoning loops, revealing only clean caption variants when the tag closes.
+4. Fail-Safe Backup Routing (Model Fallbacks): If "meta-llama/llama-4-maverick:free" drops out during image reading, immediately fall back automatically to "google/gemini-3-flash-preview" or "openrouter/free" to keep processing alive.
+
+Core Two-Step Pipeline Engine:
+- User Event: Upload an image/video file along with a selected target social media platform and niche tone (e.g., Hinglish, Savage, Funny, Professional).
+- Step 1 (Visual Analysis): Convert file uploads to base64 formatting, send the object to "meta-llama/llama-4-maverick:free", and return clean JSON structure matching: {scene_description, vibe_or_mood, dominant_colors, object_tags, subject_count}.
+- Step 2 (Direct Generation & Polish): Pipe that structured metadata into "deepseek/deepseek-r1:free". Task it via strict system instructions to generate exactly 5 distinct, production-ready caption variations directly containing localized high-converting hooks, clean grammar structure, seamless cultural Hinglish expressions, 5 to 8 contextual hashtags, and a distinct Call-to-Action.
+- Optional Step 3 (Manual Refinement Pass): Include a prominent button on caption result cards named "Refine via Scout". Clicking this issues a localized request to "meta-llama/llama-4-scout:free" to quickly clean up structural layout or replace hashtags for that explicit text line.
+
+User Interface Architecture:
+- Theme: Ultra-modern, high-contrast dark palette tailored for creators.
+- Control Panel: A drag-and-drop media layout box displaying live client-side image rendering previews, beside easy selector dropdown grids for digital media networks and tones.
+- Response Interface: Cards highlighting each generated output with interactive "Copy to Clipboard" buttons, and an active toggle link to save choice items into their permanent collection gallery.
