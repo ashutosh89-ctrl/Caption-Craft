@@ -3,13 +3,15 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: CaptionCraft API specification
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: captions
+    description: Caption generation and gallery
 paths:
   /healthz:
     get:
@@ -24,13 +26,322 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /captions/generate:
+    post:
+      operationId: generateCaptions
+      tags: [captions]
+      summary: Generate 5 AI captions from an uploaded image
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenerateInput"
+      responses:
+        "200":
+          description: Generated captions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenerateResult"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: AI pipeline error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /captions/refine:
+    post:
+      operationId: refineCaption
+      tags: [captions]
+      summary: Refine a single caption using Scout model
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefineInput"
+      responses:
+        "200":
+          description: Refined caption
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RefinedCaption"
+        "500":
+          description: AI pipeline error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /captions:
+    get:
+      operationId: listSavedCaptions
+      tags: [captions]
+      summary: List all saved captions in the gallery
+      parameters:
+        - name: platform
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: tone
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+      responses:
+        "200":
+          description: List of saved captions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SavedCaption"
+    post:
+      operationId: saveCaption
+      tags: [captions]
+      summary: Save a generated caption to the gallery
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SavedCaptionInput"
+      responses:
+        "201":
+          description: Caption saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SavedCaption"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /captions/{id}:
+    delete:
+      operationId: deleteCaption
+      tags: [captions]
+      summary: Delete a saved caption
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /captions/stats:
+    get:
+      operationId: getCaptionStats
+      tags: [captions]
+      summary: Get caption generation stats grouped by platform and tone
+      responses:
+        "200":
+          description: Stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaptionStats"
+
 components:
   schemas:
     HealthStatus:
       type: object
+      required: [status]
       properties:
         status:
           type: string
-      required:
-        - status
 
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    GenerateInput:
+      type: object
+      required: [imageBase64, imageType, platform, tone]
+      properties:
+        imageBase64:
+          type: string
+          description: Base64-encoded image data
+        imageType:
+          type: string
+          description: MIME type e.g. image/jpeg
+        platform:
+          type: string
+          description: "Target platform: Instagram, LinkedIn, YouTube"
+        tone:
+          type: string
+          description: "Tone: Desi/Hinglish, Funny, Professional, Savage"
+
+    GenerateResult:
+      type: object
+      required: [captions, visualAnalysis]
+      properties:
+        captions:
+          type: array
+          items:
+            $ref: "#/components/schemas/GeneratedCaption"
+        visualAnalysis:
+          $ref: "#/components/schemas/VisualAnalysis"
+
+    GeneratedCaption:
+      type: object
+      required: [text, hashtags, cta]
+      properties:
+        text:
+          type: string
+        hashtags:
+          type: array
+          items:
+            type: string
+        cta:
+          type: string
+
+    VisualAnalysis:
+      type: object
+      required: [sceneDescription, mood, keyObjects, colorPalette, humanCount]
+      properties:
+        sceneDescription:
+          type: string
+        mood:
+          type: string
+        keyObjects:
+          type: array
+          items:
+            type: string
+        colorPalette:
+          type: array
+          items:
+            type: string
+        humanCount:
+          type: integer
+
+    RefineInput:
+      type: object
+      required: [captionText, platform, tone, hashtags, cta]
+      properties:
+        captionText:
+          type: string
+        platform:
+          type: string
+        tone:
+          type: string
+        hashtags:
+          type: array
+          items:
+            type: string
+        cta:
+          type: string
+
+    RefinedCaption:
+      type: object
+      required: [text, hashtags, cta]
+      properties:
+        text:
+          type: string
+        hashtags:
+          type: array
+          items:
+            type: string
+        cta:
+          type: string
+
+    SavedCaptionInput:
+      type: object
+      required: [text, hashtags, cta, platform, tone]
+      properties:
+        text:
+          type: string
+        hashtags:
+          type: array
+          items:
+            type: string
+        cta:
+          type: string
+        platform:
+          type: string
+        tone:
+          type: string
+        imagePreviewBase64:
+          type: ["string", "null"]
+          description: Optional small base64 thumbnail
+
+    SavedCaption:
+      type: object
+      required: [id, text, hashtags, cta, platform, tone, createdAt]
+      properties:
+        id:
+          type: integer
+        text:
+          type: string
+        hashtags:
+          type: array
+          items:
+            type: string
+        cta:
+          type: string
+        platform:
+          type: string
+        tone:
+          type: string
+        imagePreviewBase64:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+          format: date-time
+
+    CaptionStats:
+      type: object
+      required: [totalSaved, byPlatform, byTone]
+      properties:
+        totalSaved:
+          type: integer
+        byPlatform:
+          type: array
+          items:
+            $ref: "#/components/schemas/StatCount"
+        byTone:
+          type: array
+          items:
+            $ref: "#/components/schemas/StatCount"
+
+    StatCount:
+      type: object
+      required: [label, count]
+      properties:
+        label:
+          type: string
+        count:
+          type: integer

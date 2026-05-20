@@ -6,6 +6,10 @@
  * OpenAPI spec version: 0.1.0
  */
 
-export interface HealthStatus {
-  status: string;
+export interface RefineInput {
+  captionText: string;
+  platform: string;
+  tone: string;
+  hashtags: string[];
+  cta: string;
 }
