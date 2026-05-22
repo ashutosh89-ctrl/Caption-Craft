@@ -1,0 +1,33 @@
+Project Name: CaptionCraft — Secure High-Availability SaaS for Indian Creators
+
+Tech Stack & System Environment:
+- Framework: Next.js (App Router) or Vite + Express Node.js.
+- Database: Embedded SQLite or lowdb to handle user records and generation history logs.
+- Environment Secrets Needed: OR_KEY_1, OR_KEY_2, OR_KEY_3, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, NEXTAUTH_SECRET.
+
+Authentication Layer (Google OAuth Setup):
+- Implement full Google Email Authentication using Auth.js (NextAuth) or Passport.js.
+- Protect all dashboard routes: Anonymous users must be redirected straight to a clean, attractive landing page with a "Sign in with Google" button.
+- Database Schema Configuration: Upon successful Google authentication, save or update a user record matching these strict fields:
+  * email (String, unique identifier from Google)
+  * name (String, user's Google display name)
+  * image (String, URL string pointing to their Google profile avatar)
+  * status (String: defaults strictly to "FREE")
+  * usage_counter (Integer: default 0, hard-capped at 10 for FREE users, resets every 30 days)
+
+Backend Traffic Gatekeeper & API Optimization:
+- Build a route interceptor on the generation endpoint. Check the authenticated user's session email. If user.status is "FREE" and user.usage_counter >= 10, immediately reject the pipeline with an HTTP 403 status code and an error message payload.
+- Key Pool Rotation (Strategy 2): Initialize an internal backend array using your secret keys: const KEY_POOL = [process.env.OR_KEY_1, process.env.OR_KEY_2, process.env.OR_KEY_3]. Maintain a global index pointer. Every time a generation is called, cycle to the next key index in a Round-Robin chain.
+- Fail-Safe Exception Catching (Strategy 3): Wrap API routes in robust try-catch blocks. If a key returns an HTTP 429 rate limit or network error, catch it seamlessly, increment the pointer to swap to a fresh API key automatically, and retry the user request transparently.
+- Model Fallback Logic: If the primary visual reader "meta-llama/llama-4-maverick:free" or generator "deepseek/deepseek-r1:free" throws a service error, immediately re-route the prompt data to "google/gemini-3-flash-preview" or "meta-llama/llama-3.3-70b-instruct:free" respectively within 1.5 seconds.
+- Stream Content Control: Stream responses from DeepSeek R1 using 'stream: true' to avoid server gateway disconnections. Clean out raw <think> tags using runtime regex parsing before displaying the captions.
+
+Frontend Dashboard & Credit Level Bar Layout:
+- Theme: Modern, high-contrast dark-mode layout built with Tailwind CSS.
+- Multi-Device Responsiveness: Use mobile-first breakpoints. Collapse columns to a single vertical scroll on mobile screens (<768px) with a touch-friendly bottom nav or hamburger menu. Transition into a dual-pane sidebar layout on desktop views.
+- Dynamic Credit Visualizer Component (Level Bar):
+  * Create a prominent horizontal progress bar tracking user credit data (e.g., "3 / 10 Credits Used this month").
+  * Bind the width of the progress indicator dynamically using Tailwind configurations: style={{ width: `${(user.usage_counter / 10) * 100}%` }}.
+  * Code conditional color styling: The level bar fills with smooth emerald green if usage is under 5, turns to warning amber/yellow between 6 and 8, and switches to high-contrast red/coral at 9 or 10 usages.
+  * When the bar hits 10/10, display an elegant modal popup encouraging them to join the premium creator tier waitlist.
+- Functional Features: Implement a drag-and-drop media upload preview card, selector dropdown grids for social networks/tones (Hinglish, Funny, Savage), interactive "Copy to Clipboard" text elements, and a toggle option to archive chosen captions into a visual collection history matrix.

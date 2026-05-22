@@ -4,6 +4,23 @@ const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const VISION_TIMEOUT_MS = 12000;
 const TEXT_TIMEOUT_MS = 30000;
 
+// ─── API key pool — round-robin across OR_KEY_1/2/3 with OPENROUTER_API_KEY fallback ──
+const KEY_POOL = [
+  process.env["OR_KEY_1"],
+  process.env["OR_KEY_2"],
+  process.env["OR_KEY_3"],
+  process.env["OPENROUTER_API_KEY"],
+].filter(Boolean) as string[];
+
+let keyIndex = 0;
+
+function getNextKey(): string {
+  if (KEY_POOL.length === 0) throw new Error("No OpenRouter API keys configured");
+  const key = KEY_POOL[keyIndex % KEY_POOL.length]!;
+  keyIndex = (keyIndex + 1) % KEY_POOL.length;
+  return key;
+}
+
 const CAPTION_MODELS = [
   "meta-llama/llama-3.3-70b-instruct:free",
   "openai/gpt-oss-120b:free",
@@ -28,8 +45,12 @@ async function callModel(
   timeoutMs: number,
   stream = false
 ): Promise<Response | null> {
-  const apiKey = process.env["OPENROUTER_API_KEY"];
-  if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
+  let apiKey: string;
+  try {
+    apiKey = getNextKey();
+  } catch (err) {
+    throw err;
+  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -48,19 +69,18 @@ async function callModel(
     });
 
     if (!response.ok) {
-      logger.warn({ model, status: response.status }, "OpenRouter non-OK");
+      const status = response.status;
+      logger.warn({ model, status, keyIndex: (keyIndex - 1 + KEY_POOL.length) % KEY_POOL.length }, "OpenRouter non-OK");
       clearTimeout(timer);
       return null;
     }
 
-    // For non-streaming, read body and return a resolved response
     if (!stream) {
       const text = await response.text();
       clearTimeout(timer);
       return new Response(text, { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
-    // For streaming, caller is responsible for clearing timer
     clearTimeout(timer);
     return response;
   } catch (err) {
@@ -79,7 +99,6 @@ async function callWithFallback(
   for (const model of models) {
     const resp = await callModel(model, messages, timeoutMs, false);
     if (!resp) continue;
-
     try {
       const json = (await resp.json()) as {
         choices?: Array<{ message?: { content?: string } }>;
@@ -131,7 +150,7 @@ export async function extractVisuals(
           content: [
             {
               type: "text",
-              text: `Analyze this image. Return ONLY valid JSON — no markdown, no fences, no text outside the JSON:
+              text: `Analyze this image. Return ONLY valid JSON — no markdown, no fences:
 {"scene_description":"...","mood":"...","key_objects":["..."],"color_palette":["..."],"human_count":0}`,
             },
             {
@@ -143,9 +162,8 @@ export async function extractVisuals(
       ],
       VISION_TIMEOUT_MS
     );
-
     const objMatch = content.replace(/```[\s\S]*?```/g, "").match(/\{[\s\S]*\}/);
-    if (!objMatch) throw new Error("No JSON object found");
+    if (!objMatch) throw new Error("No JSON found");
     const parsed = JSON.parse(objMatch[0]) as VisualAnalysis;
     if (parsed.scene_description) return parsed;
     throw new Error("Missing scene_description");
@@ -156,30 +174,30 @@ export async function extractVisuals(
 }
 
 function buildCaptionPrompt(visual: VisualAnalysis, platform: string, tone: string): string {
-  const toneInstructions: Record<string, string> = {
-    "Desi/Hinglish": "Write in smooth Hinglish — natural blend of Hindi and English that sounds like how young Indians actually talk. No forced translations. Keep it organic.",
-    Funny: "Write with sharp wit and humor. Unexpected twists, self-deprecating observations, make people laugh.",
-    Professional: "Polished, confident, insight-driven English. Thought leadership. LinkedIn-ready.",
+  const toneMap: Record<string, string> = {
+    "Desi/Hinglish": "Smooth Hinglish — natural blend of Hindi and English. No forced translations.",
+    Funny: "Sharp wit and humor. Unexpected twists, self-deprecating observations.",
+    Professional: "Polished, confident, insight-driven English. LinkedIn thought leadership.",
     Savage: "Bold, unapologetic, clever. The kind of caption people screenshot.",
   };
-  const platformInstructions: Record<string, string> = {
-    Instagram: "Instagram: visual storytelling, hook in first line, conversational.",
-    LinkedIn: "LinkedIn: professional story with a lesson, thought leadership.",
-    YouTube: "YouTube: catchy hook, searchable keywords, value proposition.",
+  const platformMap: Record<string, string> = {
+    Instagram: "Visual storytelling, hook in first line, conversational.",
+    LinkedIn: "Professional story with a lesson, thought leadership angle.",
+    YouTube: "Catchy hook, searchable keywords, value proposition upfront.",
   };
   return `You are an elite social media strategist for Indian creators. Write exactly 5 viral captions.
 
 IMAGE: ${visual.scene_description}
 Mood: ${visual.mood} | Elements: ${visual.key_objects.join(", ")} | Colors: ${visual.color_palette.join(", ")} | People: ${visual.human_count}
 
-PLATFORM: ${platform} — ${platformInstructions[platform] ?? platform}
-TONE: ${tone} — ${toneInstructions[tone] ?? tone}
+PLATFORM: ${platform} — ${platformMap[platform] ?? platform}
+TONE: ${tone} — ${toneMap[tone] ?? tone}
 
-Each caption must:
-- Open with a scroll-stopping hook
-- Flow naturally, no awkward phrasing
-- Include 5-8 specific contextual hashtags (no #love #life generics)
-- End with exactly ONE strong call-to-action
+Rules:
+- Scroll-stopping hook as first line
+- Natural flow, no awkward phrasing
+- 5-8 specific contextual hashtags (no #love #life generics)
+- Exactly ONE strong call-to-action per caption
 
 Output ONLY this JSON array — no markdown, no fences, nothing else:
 [{"text":"caption without hashtags","hashtags":["tag1","tag2","tag3","tag4","tag5"],"cta":"call to action"},{"text":"...","hashtags":["..."],"cta":"..."},{"text":"...","hashtags":["..."],"cta":"..."},{"text":"...","hashtags":["..."],"cta":"..."},{"text":"...","hashtags":["..."],"cta":"..."}]`;
@@ -191,16 +209,14 @@ function parseCaptions(raw: string): GeneratedCaption[] {
     .replace(/```\n?/g, "")
     .replace(/<think>[\s\S]*?<\/think>/gi, "")
     .trim();
-
   const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
   const jsonStr = arrayMatch ? arrayMatch[0] : cleaned;
-
   try {
     const parsed = JSON.parse(jsonStr) as GeneratedCaption[];
     if (Array.isArray(parsed) && parsed.length > 0) return parsed.slice(0, 5);
-    throw new Error("Not an array");
+    throw new Error("Empty array");
   } catch {
-    logger.warn({ jsonStr: jsonStr.slice(0, 400) }, "Failed to parse captions");
+    logger.warn({ jsonStr: jsonStr.slice(0, 400) }, "Failed to parse captions JSON");
     const fallback: GeneratedCaption = {
       text: "AI returned an unexpected format. Please try generating again.",
       hashtags: ["#content", "#creator", "#india", "#viral"],
@@ -215,16 +231,14 @@ export async function generateCaptions(
   platform: string,
   tone: string
 ): Promise<GeneratedCaption[]> {
-  const prompt = buildCaptionPrompt(visual, platform, tone);
   const content = await callWithFallback(
     CAPTION_MODELS,
-    [{ role: "user", content: prompt }],
+    [{ role: "user", content: buildCaptionPrompt(visual, platform, tone) }],
     TEXT_TIMEOUT_MS
   );
   return parseCaptions(content);
 }
 
-// SSE-friendly streaming generator — yields events for stage updates and final result
 export type SSEEvent =
   | { type: "stage"; message: string }
   | { type: "thinking" }
@@ -237,15 +251,12 @@ export async function* generateCaptionsStream(
   platform: string,
   tone: string
 ): AsyncGenerator<SSEEvent> {
-  const apiKey = process.env["OPENROUTER_API_KEY"];
-  if (!apiKey) {
-    yield { type: "error", message: "OPENROUTER_API_KEY is not configured" };
+  if (KEY_POOL.length === 0) {
+    yield { type: "error", message: "No OpenRouter API keys configured" };
     return;
   }
 
-  // Stage 1: Visual analysis
   yield { type: "stage", message: "Maverick is scanning your visuals..." };
-
   let visual: VisualAnalysis;
   try {
     visual = await extractVisuals(imageBase64, imageType);
@@ -253,16 +264,14 @@ export async function* generateCaptionsStream(
     visual = FALLBACK_VISUAL;
   }
 
-  // Stage 2: Caption generation via streaming
   yield { type: "stage", message: "DeepSeek R1 is reasoning your captions..." };
   yield { type: "thinking" };
 
-  const prompt = buildCaptionPrompt(visual, platform, tone);
-  const messages = [{ role: "user", content: prompt }];
+  const messages = [{ role: "user", content: buildCaptionPrompt(visual, platform, tone) }];
 
-  // Try streaming with each model
   for (const model of CAPTION_MODELS) {
     try {
+      const apiKey = getNextKey();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), TEXT_TIMEOUT_MS);
 
@@ -280,69 +289,41 @@ export async function* generateCaptionsStream(
           body: JSON.stringify({ model, messages, stream: true }),
         });
         if (r.ok) streamResp = r;
-        else {
-          logger.warn({ model, status: r.status }, "Stream model non-OK");
-        }
+        else logger.warn({ model, status: r.status }, "Stream model non-OK");
       } catch (fetchErr) {
         logger.warn({ model, fetchErr }, "Stream fetch failed");
       }
 
       clearTimeout(timer);
+      if (!streamResp?.body) continue;
 
-      if (!streamResp || !streamResp.body) continue;
-
-      // Read streaming chunks and accumulate full text
       const reader = streamResp.body.getReader();
       const decoder = new TextDecoder();
       let accumulated = "";
-      let insideThink = false;
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-
         const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split("\n");
-
-        for (const line of lines) {
+        for (const line of chunk.split("\n")) {
           if (!line.startsWith("data: ")) continue;
           const data = line.slice(6).trim();
           if (data === "[DONE]") break;
-
           try {
             const parsed = JSON.parse(data) as {
               choices?: Array<{ delta?: { content?: string } }>;
             };
             const delta = parsed.choices?.[0]?.delta?.content;
-            if (!delta) continue;
-
-            accumulated += delta;
-
-            // Detect thinking blocks
-            if (accumulated.includes("<think>") && !insideThink) {
-              insideThink = true;
-            }
-            if (accumulated.includes("</think>") && insideThink) {
-              insideThink = false;
-            }
-          } catch {
-            // malformed chunk — skip
-          }
+            if (delta) accumulated += delta;
+          } catch { /* malformed chunk */ }
         }
       }
 
       if (accumulated.trim()) {
-        const captions = parseCaptions(accumulated);
         yield {
           type: "done",
-          captions,
-          visualAnalysis: {
-            scene_description: visual.scene_description,
-            mood: visual.mood,
-            key_objects: visual.key_objects,
-            color_palette: visual.color_palette,
-            human_count: visual.human_count,
-          },
+          captions: parseCaptions(accumulated),
+          visualAnalysis: visual,
         };
         return;
       }
@@ -351,7 +332,7 @@ export async function* generateCaptionsStream(
     }
   }
 
-  yield { type: "error", message: "All models are heavily loaded. Please try again in a moment." };
+  yield { type: "error", message: "Servers are heavily loaded, please try again in a moment." };
 }
 
 export async function refineCaption(
@@ -367,7 +348,7 @@ Caption: ${captionText}
 Hashtags: ${hashtags.join(" ")}
 CTA: ${cta}
 
-Strengthen the hook, trim weak hashtags (keep 5-8 best), sharpen the CTA, fix awkward phrasing.
+Strengthen the hook, keep only 5-8 best hashtags, sharpen CTA, fix awkward phrasing.
 
 Output ONLY this JSON — no markdown, no fences:
 {"text":"refined caption","hashtags":["tag1","tag2","tag3","tag4","tag5"],"cta":"sharpened cta"}`;

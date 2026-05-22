@@ -6,6 +6,7 @@ import {
   getGetCaptionStatsQueryKey,
 } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
+import { useAuth } from "@/contexts/auth";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
@@ -93,6 +94,7 @@ export default function Home() {
   const [errorMsg, setErrorMsg] = useState("");
 
   const { toast } = useToast();
+  const { refetch: refetchAuth } = useAuth();
 
   const processFile = (f: File) => {
     if (!f.type.startsWith("image/")) {
@@ -133,11 +135,21 @@ export default function Home() {
     try {
       const response = await fetch(`${import.meta.env.BASE_URL}api/captions/stream`, {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ imageBase64: base64Image, imageType: file.type, platform, tone }),
       });
 
-      if (!response.ok || !response.body) throw new Error(`Request failed: ${response.status}`);
+      if (!response.ok || !response.body) {
+        const errJson = await response.json().catch(() => ({})) as { code?: string; error?: string };
+        if (errJson.code === "LIMIT_REACHED") {
+          setErrorMsg("Monthly limit reached. You've used all 10 free credits.");
+          setStage("error");
+          await refetchAuth();
+          return;
+        }
+        throw new Error(`Request failed: ${response.status}`);
+      }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -174,6 +186,7 @@ export default function Home() {
             } else if (event.type === "done") {
               setResult({ captions: event.captions, visualAnalysis: event.visualAnalysis });
               setStage("done");
+              void refetchAuth();
             } else if (event.type === "error") {
               setErrorMsg(event.message);
               setStage("error");

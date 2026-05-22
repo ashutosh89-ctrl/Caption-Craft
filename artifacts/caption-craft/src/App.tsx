@@ -2,14 +2,38 @@ import { Switch, Route, Router as WouterRouter } from "wouter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { AuthProvider, useAuth } from "@/contexts/auth";
 import NotFound from "@/pages/not-found";
 import { Layout } from "@/components/layout";
 import Home from "@/pages/home";
 import Gallery from "@/pages/gallery";
+import Landing from "@/pages/landing";
+import { Loader2 } from "lucide-react";
 
 const queryClient = new QueryClient();
 
-function Router() {
+function AppRoutes() {
+  const { isLoading, isAuthenticated, authEnabled } = useAuth();
+
+  // Show a centered spinner while the auth state resolves
+  if (isLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <Loader2 className="w-8 h-8 animate-spin text-primary" />
+      </div>
+    );
+  }
+
+  // When auth is configured and user is not signed in → show landing page (no layout chrome)
+  if (authEnabled && !isAuthenticated) {
+    return (
+      <Layout>
+        <Landing />
+      </Layout>
+    );
+  }
+
+  // Authenticated (or auth not configured in dev mode) → full dashboard
   return (
     <Layout>
       <Switch>
@@ -26,7 +50,9 @@ function App() {
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
-          <Router />
+          <AuthProvider>
+            <AppRoutes />
+          </AuthProvider>
         </WouterRouter>
         <Toaster />
       </TooltipProvider>
