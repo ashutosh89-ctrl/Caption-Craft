@@ -1,5 +1,8 @@
 modules = ["nodejs-24"]
 
+[env]
+PATH = "/usr/local/lib/node_modules/corepack/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 [deployment]
 router = "application"
 deploymentTarget = "autoscale"
