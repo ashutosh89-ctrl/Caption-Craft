@@ -3,22 +3,37 @@ import { logger } from "./logger";
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const VISION_TIMEOUT_MS = 12000;
 const TEXT_TIMEOUT_MS = 30000;
+const RATE_LIMIT_COOLDOWN_MS = 60_000;
 
-// ─── API key pool — round-robin across OR_KEY_1/2/3 with OPENROUTER_API_KEY fallback ──
-const KEY_POOL = [
+// ─── 2-key rotation pool with 429 cooldown ──────────────────────────────────────
+const KEY_POOL: string[] = [
   process.env["OR_KEY_1"],
   process.env["OR_KEY_2"],
-  process.env["OR_KEY_3"],
-  process.env["OPENROUTER_API_KEY"],
 ].filter(Boolean) as string[];
 
-let keyIndex = 0;
+const cooldownMap = new Map<string, number>();
 
 function getNextKey(): string {
   if (KEY_POOL.length === 0) throw new Error("No OpenRouter API keys configured");
-  const key = KEY_POOL[keyIndex % KEY_POOL.length]!;
-  keyIndex = (keyIndex + 1) % KEY_POOL.length;
-  return key;
+  const now = Date.now();
+  for (let i = 0; i < KEY_POOL.length; i++) {
+    const key = KEY_POOL[i]!;
+    const cooldownUntil = cooldownMap.get(key);
+    if (!cooldownUntil || now >= cooldownUntil) return key;
+  }
+  logger.warn("All OpenRouter keys on cooldown — using least-recently-cooled key");
+  let earliest = Infinity;
+  let best = KEY_POOL[0]!;
+  for (const key of KEY_POOL) {
+    const until = cooldownMap.get(key) ?? 0;
+    if (until < earliest) { earliest = until; best = key; }
+  }
+  return best;
+}
+
+function markRateLimited(key: string): void {
+  cooldownMap.set(key, Date.now() + RATE_LIMIT_COOLDOWN_MS);
+  logger.info({ keyHint: key.slice(-4) }, "Key rate-limited, 60s cooldown");
 }
 
 const CAPTION_MODELS = [
@@ -45,12 +60,7 @@ async function callModel(
   timeoutMs: number,
   stream = false
 ): Promise<Response | null> {
-  let apiKey: string;
-  try {
-    apiKey = getNextKey();
-  } catch (err) {
-    throw err;
-  }
+  const apiKey = getNextKey();
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -70,7 +80,8 @@ async function callModel(
 
     if (!response.ok) {
       const status = response.status;
-      logger.warn({ model, status, keyIndex: (keyIndex - 1 + KEY_POOL.length) % KEY_POOL.length }, "OpenRouter non-OK");
+      if (status === 429) markRateLimited(apiKey);
+      logger.warn({ model, status, keyHint: apiKey.slice(-4) }, "OpenRouter non-OK");
       clearTimeout(timer);
       return null;
     }
@@ -249,7 +260,8 @@ export async function* generateCaptionsStream(
   imageBase64: string,
   imageType: string,
   platform: string,
-  tone: string
+  tone: string,
+  clientAbortSignal?: AbortSignal
 ): AsyncGenerator<SSEEvent> {
   if (KEY_POOL.length === 0) {
     yield { type: "error", message: "No OpenRouter API keys configured" };
@@ -270,10 +282,18 @@ export async function* generateCaptionsStream(
   const messages = [{ role: "user", content: buildCaptionPrompt(visual, platform, tone) }];
 
   for (const model of CAPTION_MODELS) {
+    if (clientAbortSignal?.aborted) {
+      logger.info("Client disconnected, aborting stream pipeline");
+      return;
+    }
     try {
       const apiKey = getNextKey();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), TEXT_TIMEOUT_MS);
+
+      // Link client abort to this request's abort
+      const onClientAbort = () => controller.abort();
+      clientAbortSignal?.addEventListener("abort", onClientAbort);
 
       let streamResp: Response | null = null;
       try {
@@ -289,9 +309,14 @@ export async function* generateCaptionsStream(
           body: JSON.stringify({ model, messages, stream: true }),
         });
         if (r.ok) streamResp = r;
-        else logger.warn({ model, status: r.status }, "Stream model non-OK");
+        else {
+          if (r.status === 429) markRateLimited(apiKey);
+          logger.warn({ model, status: r.status }, "Stream model non-OK");
+        }
       } catch (fetchErr) {
         logger.warn({ model, fetchErr }, "Stream fetch failed");
+      } finally {
+        clientAbortSignal?.removeEventListener("abort", onClientAbort);
       }
 
       clearTimeout(timer);
@@ -302,6 +327,11 @@ export async function* generateCaptionsStream(
       let accumulated = "";
 
       while (true) {
+        if (clientAbortSignal?.aborted) {
+          reader.cancel().catch(() => {});
+          logger.info("Client disconnected mid-stream, releasing reader");
+          return;
+        }
         const { done, value } = await reader.read();
         if (done) break;
         const chunk = decoder.decode(value, { stream: true });

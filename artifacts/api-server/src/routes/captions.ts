@@ -41,12 +41,61 @@ async function incrementUsage(req: Request): Promise<void> {
     .where(eq(usersTable.id, userId));
 }
 
+async function decrementUsage(req: Request): Promise<void> {
+  if (!AUTH_ENABLED || !req.user) return;
+  const userId = (req.user as { id: number }).id;
+  await db
+    .update(usersTable)
+    .set({ usageCounter: sql`greatest(${usersTable.usageCounter} - 1, 0)` })
+    .where(eq(usersTable.id, userId));
+}
+
+async function atomicCreditLock(req: Request, res: Response): Promise<boolean> {
+  if (!AUTH_ENABLED || !req.user) return true;
+  const userId = (req.user as { id: number }).id;
+  const result = await db
+    .update(usersTable)
+    .set({ usageCounter: sql`${usersTable.usageCounter} + 1` })
+    .where(eq(usersTable.id, userId))
+    .returning({ usageCounter: usersTable.usageCounter, status: usersTable.status });
+  const row = result[0];
+  if (!row) {
+    res.status(500).json({ error: "User not found", code: "USER_NOT_FOUND" });
+    return false;
+  }
+  if (row.status === "FREE" && row.usageCounter > 10) {
+    await db
+      .update(usersTable)
+      .set({ usageCounter: sql`${usersTable.usageCounter} - 1` })
+      .where(eq(usersTable.id, userId));
+    res.status(403).json({
+      error: "Monthly caption limit reached. Join our premium waitlist to continue.",
+      code: "LIMIT_REACHED",
+    });
+    return false;
+  }
+  return true;
+}
+
 // ─── Streaming endpoint (SSE) ─────────────────────────────────────────────────
 router.post("/captions/stream", requireAuthAndUsage, async (req: Request, res: Response): Promise<void> => {
   const parsed = GenerateCaptionsBody.safeParse(req.body);
   if (!parsed.success) { res.status(400).json({ error: parsed.error.message }); return; }
 
   const { imageBase64, imageType, platform, tone } = parsed.data;
+
+  // Atomic credit lock: increment BEFORE calling OpenRouter
+  const creditLocked = await atomicCreditLock(req, res);
+  if (!creditLocked) return; // response already sent (403/500)
+
+  // AbortController linked to client disconnect
+  const clientAbort = new AbortController();
+  req.on("close", () => {
+    if (!res.writableEnded) {
+      clientAbort.abort();
+      logger.info("Client disconnected, aborting OpenRouter stream");
+    }
+  });
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -55,15 +104,15 @@ router.post("/captions/stream", requireAuthAndUsage, async (req: Request, res: R
   res.flushHeaders();
 
   function send(data: unknown): void {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
   }
 
-  const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), 5000);
+  const heartbeat = setInterval(() => { if (!res.writableEnded) res.write(": heartbeat\n\n"); }, 5000);
   req.log.info({ platform, tone }, "Starting streaming pipeline");
 
   let succeeded = false;
   try {
-    for await (const event of generateCaptionsStream(imageBase64, imageType, platform, tone)) {
+    for await (const event of generateCaptionsStream(imageBase64, imageType, platform, tone, clientAbort.signal)) {
       send(event);
       if (event.type === "done") { succeeded = true; break; }
       if (event.type === "error") break;
@@ -72,8 +121,8 @@ router.post("/captions/stream", requireAuthAndUsage, async (req: Request, res: R
     req.log.error({ err }, "Stream pipeline error");
     send({ type: "error", message: "Pipeline failed unexpectedly. Please try again." });
   } finally {
-    if (succeeded) {
-      try { await incrementUsage(req); } catch (err) { logger.warn({ err }, "Failed to increment usage"); }
+    if (!succeeded) {
+      try { await decrementUsage(req); } catch (err) { logger.warn({ err }, "Failed to refund credit"); }
     }
     clearInterval(heartbeat);
     res.end();

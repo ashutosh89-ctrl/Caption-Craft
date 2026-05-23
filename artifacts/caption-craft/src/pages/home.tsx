@@ -18,19 +18,7 @@ import {
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
-import {
-  UploadCloud,
-  Sparkles,
-  Copy,
-  CheckCircle,
-  RefreshCcw,
-  Save,
-  Loader2,
-  BrainCircuit,
-  ScanEye,
-  Zap,
-  ImageIcon,
-} from "lucide-react";
+import { CloudUpload as UploadCloud, Sparkles, Copy, CircleCheck as CheckCircle, RefreshCcw, Save, Loader as Loader2, BrainCircuit, ScanEye, Zap, Image as ImageIcon } from "lucide-react";
 
 const PLATFORMS = ["Instagram", "LinkedIn", "YouTube"];
 const TONES = ["Desi/Hinglish", "Funny", "Professional", "Savage"];
@@ -102,16 +90,29 @@ export default function Home() {
       return;
     }
     setFile(f);
-    setPreviewUrl(URL.createObjectURL(f));
     setResult(null);
     setErrorMsg("");
     setStage("idle");
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const res = e.target?.result as string;
-      setBase64Image(res.split(",")[1] ?? "");
+
+    // Canvas compression: resize to max 1200px width, then Base64
+    const img = new Image();
+    img.onload = () => {
+      const MAX_WIDTH = 1200;
+      let { width, height } = img;
+      if (width > MAX_WIDTH) {
+        height = Math.round((height * MAX_WIDTH) / width);
+        width = MAX_WIDTH;
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d")!;
+      ctx.drawImage(img, 0, 0, width, height);
+      const dataUrl = canvas.toDataURL(f.type === "image/png" ? "image/png" : "image/jpeg", 0.85);
+      setPreviewUrl(dataUrl);
+      setBase64Image(dataUrl.split(",")[1] ?? "");
     };
-    reader.readAsDataURL(f);
+    img.src = URL.createObjectURL(f);
   };
 
   const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(true); };

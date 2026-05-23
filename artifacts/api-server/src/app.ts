@@ -8,6 +8,12 @@ import { logger } from "./lib/logger";
 import passportInstance from "./lib/passport";
 import { pool } from "@workspace/db";
 
+// ─── SESSION_SECRET crash guard ─────────────────────────────────────────────────
+if (!process.env["SESSION_SECRET"]) {
+  logger.error("FATAL: SESSION_SECRET environment variable is missing. Server cannot start safely.");
+  process.exit(1);
+}
+
 const PgStore = connectPg(session);
 const app: Express = express();
 
@@ -29,8 +35,14 @@ app.use(
 );
 
 app.use(cors({ credentials: true, origin: true }));
-app.use(express.json({ limit: "20mb" }));
-app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+
+// ─── Segregated payload limits ─────────────────────────────────────────────────
+// 150kb for general text routes
+app.use(express.json({ limit: "150kb" }));
+app.use(express.urlencoded({ extended: true, limit: "150kb" }));
+
+// 4mb override for the captions/stream route (Base64 images)
+app.use("/api/captions/stream", express.json({ limit: "4mb" }));
 
 // ─── Session ──────────────────────────────────────────────────────────────────
 app.use(
@@ -40,7 +52,7 @@ app.use(
       createTableIfMissing: true,
       tableName: "sessions",
     }),
-    secret: process.env["SESSION_SECRET"] ?? "captioncraft-dev-secret",
+    secret: process.env["SESSION_SECRET"]!,
     resave: false,
     saveUninitialized: false,
     cookie: {
