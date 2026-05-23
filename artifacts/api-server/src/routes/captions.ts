@@ -1,6 +1,5 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
-import { desc, eq, sql } from "drizzle-orm";
-import { db, savedCaptionsTable, usersTable } from "@workspace/db";
+import { supabase } from "@workspace/db";
 import {
   GenerateCaptionsBody,
   RefineCaptionBody,
@@ -35,45 +34,57 @@ function requireAuthAndUsage(req: Request, res: Response, next: NextFunction): v
 async function incrementUsage(req: Request): Promise<void> {
   if (!AUTH_ENABLED || !req.user) return;
   const userId = (req.user as { id: number }).id;
-  await db
-    .update(usersTable)
-    .set({ usageCounter: sql`${usersTable.usageCounter} + 1` })
-    .where(eq(usersTable.id, userId));
+  const { data: user } = await supabase.from("users").select("usage_counter").eq("id", userId).single();
+  const current = user?.usage_counter ?? 0;
+  await supabase.from("users").update({ usage_counter: current + 1 }).eq("id", userId);
 }
 
 async function decrementUsage(req: Request): Promise<void> {
   if (!AUTH_ENABLED || !req.user) return;
   const userId = (req.user as { id: number }).id;
-  await db
-    .update(usersTable)
-    .set({ usageCounter: sql`greatest(${usersTable.usageCounter} - 1, 0)` })
-    .where(eq(usersTable.id, userId));
+  const { data: user } = await supabase.from("users").select("usage_counter").eq("id", userId).single();
+  const current = user?.usage_counter ?? 0;
+  await supabase.from("users").update({ usage_counter: Math.max(current - 1, 0) }).eq("id", userId);
 }
 
 async function atomicCreditLock(req: Request, res: Response): Promise<boolean> {
   if (!AUTH_ENABLED || !req.user) return true;
   const userId = (req.user as { id: number }).id;
-  const result = await db
-    .update(usersTable)
-    .set({ usageCounter: sql`${usersTable.usageCounter} + 1` })
-    .where(eq(usersTable.id, userId))
-    .returning({ usageCounter: usersTable.usageCounter, status: usersTable.status });
-  const row = result[0];
-  if (!row) {
+
+  // Read current state
+  const { data: user, error } = await supabase
+    .from("users")
+    .select("usage_counter, status")
+    .eq("id", userId)
+    .single();
+
+  if (error || !user) {
     res.status(500).json({ error: "User not found", code: "USER_NOT_FOUND" });
     return false;
   }
-  if (row.status === "FREE" && row.usageCounter > 10) {
-    await db
-      .update(usersTable)
-      .set({ usageCounter: sql`${usersTable.usageCounter} - 1` })
-      .where(eq(usersTable.id, userId));
+
+  const newCounter = (user.usage_counter as number) + 1;
+
+  // Check limit after increment
+  if (user.status === "FREE" && newCounter > 10) {
     res.status(403).json({
       error: "Monthly caption limit reached. Join our premium waitlist to continue.",
       code: "LIMIT_REACHED",
     });
     return false;
   }
+
+  // Atomically increment
+  const { error: updateError } = await supabase
+    .from("users")
+    .update({ usage_counter: newCounter })
+    .eq("id", userId);
+
+  if (updateError) {
+    res.status(500).json({ error: "Failed to lock credit", code: "CREDIT_LOCK_FAILED" });
+    return false;
+  }
+
   return true;
 }
 
@@ -86,7 +97,7 @@ router.post("/captions/stream", requireAuthAndUsage, async (req: Request, res: R
 
   // Atomic credit lock: increment BEFORE calling OpenRouter
   const creditLocked = await atomicCreditLock(req, res);
-  if (!creditLocked) return; // response already sent (403/500)
+  if (!creditLocked) return;
 
   // AbortController linked to client disconnect
   const clientAbort = new AbortController();
@@ -171,16 +182,30 @@ router.post("/captions/refine", async (req: Request, res: Response): Promise<voi
 });
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
-router.get("/captions/stats", async (req: Request, res: Response): Promise<void> => {
+router.get("/captions/stats", async (_req: Request, res: Response): Promise<void> => {
   try {
-    const [total, byPlatform, byTone] = await Promise.all([
-      db.select({ count: sql<number>`count(*)::int` }).from(savedCaptionsTable).then((r) => r[0]?.count ?? 0),
-      db.select({ label: savedCaptionsTable.platform, count: sql<number>`count(*)::int` }).from(savedCaptionsTable).groupBy(savedCaptionsTable.platform),
-      db.select({ label: savedCaptionsTable.tone, count: sql<number>`count(*)::int` }).from(savedCaptionsTable).groupBy(savedCaptionsTable.tone),
-    ]);
-    res.json({ totalSaved: total, byPlatform, byTone });
+    const { count: total } = await supabase.from("saved_captions").select("*", { count: "exact", head: true });
+    const { data: byPlatform } = await supabase.from("saved_captions").select("platform");
+    const { data: byTone } = await supabase.from("saved_captions").select("tone");
+
+    const platformCounts: Record<string, number> = {};
+    for (const r of byPlatform ?? []) {
+      const p = r.platform as string;
+      platformCounts[p] = (platformCounts[p] ?? 0) + 1;
+    }
+    const toneCounts: Record<string, number> = {};
+    for (const r of byTone ?? []) {
+      const t = r.tone as string;
+      toneCounts[t] = (toneCounts[t] ?? 0) + 1;
+    }
+
+    res.json({
+      totalSaved: total ?? 0,
+      byPlatform: Object.entries(platformCounts).map(([label, count]) => ({ label, count })),
+      byTone: Object.entries(toneCounts).map(([label, count]) => ({ label, count })),
+    });
   } catch (err) {
-    req.log.error({ err }, "Failed to fetch stats");
+    _req.log.error({ err }, "Failed to fetch stats");
     res.status(500).json({ error: "Failed to fetch stats" });
   }
 });
@@ -192,15 +217,16 @@ router.get("/captions", async (req: Request, res: Response): Promise<void> => {
 
   const { platform, tone, limit } = parsed.data;
   try {
-    let query = db.select().from(savedCaptionsTable).orderBy(desc(savedCaptionsTable.createdAt)).limit(limit ?? 50).$dynamic();
-    if (platform) query = query.where(eq(savedCaptionsTable.platform, platform));
-    if (tone) query = query.where(eq(savedCaptionsTable.tone, tone));
-    const rows = await query;
-    res.json(rows.map((r) => ({
+    let query = supabase.from("saved_captions").select("*").order("created_at", { ascending: false }).limit(limit ?? 50);
+    if (platform) query = query.eq("platform", platform);
+    if (tone) query = query.eq("tone", tone);
+    const { data: rows, error } = await query;
+    if (error) throw error;
+    res.json((rows ?? []).map((r: any) => ({
       id: r.id, text: r.text, hashtags: r.hashtags, cta: r.cta,
       platform: r.platform, tone: r.tone,
-      imagePreviewBase64: r.imagePreviewBase64 ?? null,
-      createdAt: r.createdAt.toISOString(),
+      imagePreviewBase64: r.image_preview_base64 ?? null,
+      createdAt: new Date(r.created_at).toISOString(),
     })));
   } catch (err) {
     req.log.error({ err }, "Failed to list captions");
@@ -215,15 +241,17 @@ router.post("/captions", async (req: Request, res: Response): Promise<void> => {
 
   const { text, hashtags, cta, platform, tone, imagePreviewBase64 } = parsed.data;
   try {
-    const [saved] = await db.insert(savedCaptionsTable)
-      .values({ text, hashtags, cta, platform, tone, imagePreviewBase64: imagePreviewBase64 ?? null })
-      .returning();
-    if (!saved) { res.status(500).json({ error: "Failed to save" }); return; }
+    const { data: saved, error } = await supabase.from("saved_captions")
+      .insert({ text, hashtags, cta, platform, tone, image_preview_base64: imagePreviewBase64 ?? null })
+      .select()
+      .single();
+    if (error || !saved) { res.status(500).json({ error: "Failed to save" }); return; }
+    const r = saved as any;
     res.status(201).json({
-      id: saved.id, text: saved.text, hashtags: saved.hashtags, cta: saved.cta,
-      platform: saved.platform, tone: saved.tone,
-      imagePreviewBase64: saved.imagePreviewBase64 ?? null,
-      createdAt: saved.createdAt.toISOString(),
+      id: r.id, text: r.text, hashtags: r.hashtags, cta: r.cta,
+      platform: r.platform, tone: r.tone,
+      imagePreviewBase64: r.image_preview_base64 ?? null,
+      createdAt: new Date(r.created_at).toISOString(),
     });
   } catch (err) {
     req.log.error({ err }, "Failed to save caption");
@@ -237,8 +265,12 @@ router.delete("/captions/:id", async (req: Request, res: Response): Promise<void
   const parsed = DeleteCaptionParams.safeParse({ id: raw });
   if (!parsed.success) { res.status(400).json({ error: "Invalid ID" }); return; }
   try {
-    const [deleted] = await db.delete(savedCaptionsTable).where(eq(savedCaptionsTable.id, parsed.data.id)).returning();
-    if (!deleted) { res.status(404).json({ error: "Caption not found" }); return; }
+    const { data: deleted, error } = await supabase.from("saved_captions")
+      .delete()
+      .eq("id", parsed.data.id)
+      .select()
+      .single();
+    if (error || !deleted) { res.status(404).json({ error: "Caption not found" }); return; }
     res.sendStatus(204);
   } catch (err) {
     logger.error({ err }, "Failed to delete caption");

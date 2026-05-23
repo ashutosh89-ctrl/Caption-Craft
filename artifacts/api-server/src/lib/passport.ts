@@ -1,7 +1,6 @@
 import passport from "passport";
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
-import { db, usersTable } from "@workspace/db";
-import { eq } from "drizzle-orm";
+import { supabase } from "@workspace/db";
 import { logger } from "./logger";
 
 export const AUTH_ENABLED = !!(
@@ -9,7 +8,6 @@ export const AUTH_ENABLED = !!(
 );
 
 if (AUTH_ENABLED) {
-  // Construct callback URL from Replit domain or localhost
   const callbackURL = process.env["REPLIT_DOMAINS"]
     ? `https://${process.env["REPLIT_DOMAINS"].split(",")[0]}/api/auth/google/callback`
     : "http://localhost/api/auth/google/callback";
@@ -28,40 +26,50 @@ if (AUTH_ENABLED) {
           const email = profile.emails?.[0]?.value;
           if (!email) return done(new Error("No email from Google profile"), undefined);
 
-          const existing = await db
-            .select()
-            .from(usersTable)
-            .where(eq(usersTable.googleId, profile.id))
-            .limit(1);
+          const { data: existing } = await supabase
+            .from("users")
+            .select("*")
+            .eq("google_id", profile.id)
+            .maybeSingle();
 
-          if (existing[0]) {
-            // Reset usage counter if 30 days have passed
+          if (existing) {
             const needsReset =
-              Date.now() - existing[0].usageResetAt.getTime() > 30 * 24 * 60 * 60 * 1000;
-            const [updated] = await db
-              .update(usersTable)
-              .set({
-                name: profile.displayName,
-                image: profile.photos?.[0]?.value ?? null,
-                ...(needsReset ? { usageCounter: 0, usageResetAt: new Date() } : {}),
-              })
-              .where(eq(usersTable.id, existing[0].id))
-              .returning();
-            return done(null, updated);
+              Date.now() - new Date(existing.usage_reset_at).getTime() > 30 * 24 * 60 * 60 * 1000;
+            const updateData: Record<string, unknown> = {
+              name: profile.displayName,
+              image: profile.photos?.[0]?.value ?? null,
+            };
+            if (needsReset) {
+              updateData.usage_counter = 0;
+              updateData.usage_reset_at = new Date().toISOString();
+            }
+            const { data: updated } = await supabase
+              .from("users")
+              .update(updateData)
+              .eq("id", existing.id)
+              .select()
+              .single();
+            return done(null, updated ?? existing);
           }
 
-          const [newUser] = await db
-            .insert(usersTable)
-            .values({
+          const { data: newUser, error } = await supabase
+            .from("users")
+            .insert({
               email,
               name: profile.displayName,
               image: profile.photos?.[0]?.value ?? null,
-              googleId: profile.id,
+              google_id: profile.id,
               status: "FREE",
-              usageCounter: 0,
-              usageResetAt: new Date(),
+              usage_counter: 0,
+              usage_reset_at: new Date().toISOString(),
             })
-            .returning();
+            .select()
+            .single();
+
+          if (error) {
+            logger.error({ error }, "Failed to create user via Google OAuth");
+            return done(new Error("Failed to create user"), undefined);
+          }
 
           logger.info({ email }, "New user created via Google OAuth");
           return done(null, newUser);
@@ -82,11 +90,11 @@ passport.serializeUser((user: Express.User, done) => {
 
 passport.deserializeUser(async (id: number, done) => {
   try {
-    const [user] = await db
-      .select()
-      .from(usersTable)
-      .where(eq(usersTable.id, id))
-      .limit(1);
+    const { data: user } = await supabase
+      .from("users")
+      .select("*")
+      .eq("id", id)
+      .maybeSingle();
     done(null, user ?? null);
   } catch (err) {
     done(err as Error, null);
